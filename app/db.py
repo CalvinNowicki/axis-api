@@ -10,7 +10,7 @@ from botocore.exceptions import ClientError
 
 from .settings import settings
 
-_slug_re = re.compile(r"^[a-z0-9-]+$")
+_slug_re = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -18,6 +18,19 @@ def now_utc_iso() -> str:
 def today_utc_yyyymmdd() -> str:
     # Use UTC date to match how we derive brick.day from ISO timestamps (iso[:10])
     return datetime.now(timezone.utc).date().isoformat()
+
+def _norm_name(s: str) -> str:
+    # Case-insensitive uniqueness + whitespace normalization
+    return " ".join((s or "").strip().lower().split())
+
+def _title_from_slug(slug: str) -> str:
+    return " ".join(w[:1].upper() + w[1:] for w in slug.split("-") if w)
+
+def _ring_name_guard_key(name: str) -> str:
+    return f"__ring_name__#{_norm_name(name)}"
+
+def _tracker_name_guard_key(ring_id: str, name: str) -> str:
+    return f"__trk_name__#{ring_id}#{_norm_name(name)}"
 
 def _to_ddb(val: Any) -> Any:
     if isinstance(val, bool):
@@ -63,21 +76,62 @@ def list_rings(owner_id: str) -> List[Dict[str, Any]]:
 def create_ring(owner_id: str, ring_id: str, name: str) -> Dict[str, Any]:
     if not ring_id:
         raise ValueError("ring_id_required")
+
     slug = ring_id.strip().lower()
     if not _slug_re.fullmatch(slug):
         raise ValueError("invalid_ring_id_slug")
 
-    existing = rings_tbl.get_item(Key={"owner_id": owner_id, "ring_id": slug}).get("Item")
-    if existing:
-        raise ValueError("ring_id_already_exists")
+    # Name cleanliness
+    display = (name or "").strip()
+    if not display:
+        display = _title_from_slug(slug)
 
+    name_key = _ring_name_guard_key(display)
+
+    # Unique constraints + ring create must be atomic
     item = {
         "owner_id": owner_id,
         "ring_id": slug,
-        "name": name.strip() or slug.capitalize(),
+        "name": display,
         "created_ts": now_utc_iso(),
     }
-    rings_tbl.put_item(Item=_to_ddb(item))
+
+    guard = {
+        "owner_id": owner_id,
+        "ring_id": name_key,          # same table, same PK
+        "type": "ring_name_guard",
+        "target_ring_id": slug,
+        "created_ts": now_utc_iso(),
+    }
+
+    try:
+        ddb.meta.client.transact_write_items(
+            TransactItems=[
+                {
+                    "Put": {
+                        "TableName": rings_tbl.name,
+                        "Item": _to_ddb(item),
+                        "ConditionExpression": "attribute_not_exists(owner_id) AND attribute_not_exists(ring_id)",
+                    }
+                },
+                {
+                    "Put": {
+                        "TableName": rings_tbl.name,
+                        "Item": _to_ddb(guard),
+                        "ConditionExpression": "attribute_not_exists(owner_id) AND attribute_not_exists(ring_id)",
+                    }
+                },
+            ]
+        )
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code == "TransactionCanceledException":
+            # Either ring_id exists OR name guard exists. Detect which.
+            if rings_tbl.get_item(Key={"owner_id": owner_id, "ring_id": slug}).get("Item"):
+                raise ValueError("ring_id_already_exists")
+            raise ValueError("ring_name_already_exists")
+        raise
+
     return item
 
 # ------------------------
@@ -102,30 +156,85 @@ def list_trackers(owner_id: str, ring_id: str) -> List[Dict[str, Any]]:
         raise
 
 def create_tracker(owner_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    ring_id = data["ring_id"].strip().lower()
+    ring_id = (data.get("ring_id") or "").strip().lower()
+    if not ring_id:
+        raise ValueError("ring_id_required")
 
     # confirm ring exists
     ring = rings_tbl.get_item(Key={"owner_id": owner_id, "ring_id": ring_id}).get("Item")
     if not ring:
         raise ValueError("ring_not_found")
 
-    tracker_id = str(uuid.uuid4())
+    # tracker_slug is required now (permanent id)
+    tracker_slug = (data.get("tracker_id") or "").strip().lower()
+    if not tracker_slug:
+        raise ValueError("tracker_id_required")
+    if not _slug_re.fullmatch(tracker_slug):
+        raise ValueError("invalid_tracker_id_slug")
+
+    # permanent, unique-within-ring PK
+    tracker_id = f"{ring_id}#{tracker_slug}"
+
+    # Display name: prefer provided name, else derive from slug
+    display = (data.get("name") or "").strip()
+    if not display:
+        display = _title_from_slug(tracker_slug)
+
+    # Unique name-per-ring guard
+    name_guard_key = _tracker_name_guard_key(ring_id, display)
+
     item = {
         "owner_id": owner_id,
         "tracker_id": tracker_id,
+        "tracker_slug": tracker_slug,
         "ring_id": ring_id,
-        "name": data["name"].strip(),
+        "name": display,
         "kind": data.get("kind", "boolean"),
         "cadence": data.get("cadence", "daily"),
         "target": data.get("target"),
         "active": True,
         "created_ts": now_utc_iso(),
     }
-    # remove nulls
     if item.get("target") is None:
         item.pop("target", None)
 
-    trackers_tbl.put_item(Item=_to_ddb(item))
+    guard = {
+        "owner_id": owner_id,
+        "tracker_id": name_guard_key,   # same table, same PK
+        "type": "tracker_name_guard",
+        "ring_id": ring_id,
+        "target_tracker_id": tracker_id,
+        "created_ts": now_utc_iso(),
+    }
+
+    try:
+        ddb.meta.client.transact_write_items(
+            TransactItems=[
+                {
+                    "Put": {
+                        "TableName": trackers_tbl.name,
+                        "Item": _to_ddb(item),
+                        "ConditionExpression": "attribute_not_exists(owner_id) AND attribute_not_exists(tracker_id)",
+                    }
+                },
+                {
+                    "Put": {
+                        "TableName": trackers_tbl.name,
+                        "Item": _to_ddb(guard),
+                        "ConditionExpression": "attribute_not_exists(owner_id) AND attribute_not_exists(tracker_id)",
+                    }
+                },
+            ]
+        )
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code == "TransactionCanceledException":
+            # Either tracker_id exists OR name guard exists
+            if trackers_tbl.get_item(Key={"owner_id": owner_id, "tracker_id": tracker_id}).get("Item"):
+                raise ValueError("tracker_id_already_exists")
+            raise ValueError("tracker_name_already_exists")
+        raise
+
     return item
 
 def patch_tracker(owner_id: str, tracker_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -158,7 +267,63 @@ def patch_tracker(owner_id: str, tracker_id: str, patch: Dict[str, Any]) -> Dict
         nm = patch["name"]
         if not isinstance(nm, str) or not nm.strip():
             raise ValueError("invalid_name")
-        setfield("name", nm.strip())
+        new_name = nm.strip()
+
+        # Enforce unique name-per-ring (case-insensitive), atomically
+        ring_id = cur.get("ring_id")
+        old_name = cur.get("name", "")
+        old_guard = _tracker_name_guard_key(ring_id, old_name) if old_name else None
+        new_guard = _tracker_name_guard_key(ring_id, new_name)
+
+        if _norm_name(old_name) != _norm_name(new_name):
+            # transact: put new guard (must not exist), update tracker, delete old guard
+            transact = [
+                {
+                    "Put": {
+                        "TableName": trackers_tbl.name,
+                        "Item": _to_ddb({
+                            "owner_id": owner_id,
+                            "tracker_id": new_guard,
+                            "type": "tracker_name_guard",
+                            "ring_id": ring_id,
+                            "target_tracker_id": cur["tracker_id"],
+                            "created_ts": now_utc_iso(),
+                        }),
+                        "ConditionExpression": "attribute_not_exists(owner_id) AND attribute_not_exists(tracker_id)",
+                    }
+                },
+                {
+                    "Update": {
+                        "TableName": trackers_tbl.name,
+                        "Key": _to_ddb({"owner_id": owner_id, "tracker_id": tracker_id}),
+                        "UpdateExpression": "SET #nm = :v",
+                        "ExpressionAttributeNames": {"#nm": "name"},
+                        "ExpressionAttributeValues": _to_ddb({":v": new_name}),
+                    }
+                },
+            ]
+
+            if old_guard:
+                transact.append({
+                    "Delete": {
+                        "TableName": trackers_tbl.name,
+                        "Key": _to_ddb({"owner_id": owner_id, "tracker_id": old_guard}),
+                    }
+                })
+
+            try:
+                ddb.meta.client.transact_write_items(TransactItems=transact)
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") == "TransactionCanceledException":
+                    raise ValueError("tracker_name_already_exists")
+                raise
+
+            # refresh updated record
+            cur2 = trackers_tbl.get_item(Key={"owner_id": owner_id, "tracker_id": tracker_id}).get("Item")
+            return _from_ddb(cur2)
+
+        # same normalized name; just set trimmed
+        setfield("name", new_name)
 
     if "active" in patch:
         setfield("active", bool(patch["active"]))

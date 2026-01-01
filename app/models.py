@@ -16,9 +16,9 @@ class RingOut(RingIn):
 # ---------- Trackers ----------
 class TrackerIn(BaseModel):
     ring_id: str
-    name: str
+    tracker_id: str = Field(..., description="slug, e.g. did-you-read")
+    name: Optional[str] = None  # optional; server will derive if blank
     kind: Kind = "boolean"
-    # V1 can ignore cadence/targets for rings grid; keep room:
     cadence: Optional[str] = "daily"
     target: Optional[Dict[str, Any]] = None
 

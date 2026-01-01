@@ -56,6 +56,8 @@ def create_ring(data: RingIn, user_id: str = Depends(current_user)):
             raise HTTPException(status_code=400, detail=msg)
         if msg == "ring_id_already_exists":
             raise HTTPException(status_code=409, detail=msg)
+        if msg == "ring_name_already_exists":
+            raise HTTPException(status_code=409, detail=msg)
         raise
 
 # ---------------- Trackers ----------------
@@ -74,6 +76,10 @@ def create_tracker(data: TrackerIn, user_id: str = Depends(current_user)):
         msg = str(e)
         if msg == "ring_not_found":
             raise HTTPException(status_code=404, detail=msg)
+        if msg in ("tracker_id_required", "invalid_tracker_id_slug"):
+            raise HTTPException(status_code=400, detail=msg)
+        if msg in ("tracker_id_already_exists", "tracker_name_already_exists"):
+            raise HTTPException(status_code=409, detail=msg)
         raise
 
 @app.patch("/v1/tracker/{tracker_id}")
