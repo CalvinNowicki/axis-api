@@ -71,7 +71,15 @@ def list_rings(owner_id: str) -> List[Dict[str, Any]]:
         ScanIndexForward=True,
     )
     items = [_from_ddb(i) for i in resp.get("Items", [])]
-    return items
+
+    # ✅ Guard rails live in same table; never return them as real rings
+    rings = [
+        i for i in items
+        if not str(i.get("ring_id", "")).startswith("__ring_name__#")
+        and i.get("type") != "ring_name_guard"
+        and "name" in i
+    ]
+    return rings
 
 def create_ring(owner_id: str, ring_id: str, name: str) -> Dict[str, Any]:
     if not ring_id:
@@ -146,14 +154,23 @@ def list_trackers(owner_id: str, ring_id: str) -> List[Dict[str, Any]]:
             KeyConditionExpression=Key("ring_id").eq(ring_id) & Key("owner_id").eq(owner_id),
             ScanIndexForward=True,
         )
-        return [_from_ddb(i) for i in resp.get("Items", [])]
+        items = [_from_ddb(i) for i in resp.get("Items", [])]
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ValidationException":
-            # Safety fallback while index is being created
             scan = trackers_tbl.scan()
             items = [i for i in scan.get("Items", []) if i.get("owner_id") == owner_id and i.get("ring_id") == ring_id]
-            return [_from_ddb(i) for i in items]
-        raise
+            items = [_from_ddb(i) for i in items]
+        else:
+            raise
+
+    # ✅ Filter tracker-name guards (same-table trick)
+    trackers = [
+        i for i in items
+        if not str(i.get("tracker_id", "")).startswith("__trk_name__#")
+        and i.get("type") != "tracker_name_guard"
+        and "name" in i
+    ]
+    return trackers
 
 def create_tracker(owner_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     ring_id = (data.get("ring_id") or "").strip().lower()
@@ -416,6 +433,8 @@ def dashboard_today(owner_id: str) -> Dict[str, Any]:
 
     ring_summaries = []
     for r in rings:
+        if not r.get("ring_id") or not r.get("name"):
+            continue
         trackers = list_trackers(owner_id, r["ring_id"])
         active = [t for t in trackers if t.get("active", True)]
         total = len(active)
