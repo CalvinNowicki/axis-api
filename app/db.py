@@ -1,5 +1,6 @@
 import os, re, uuid
 from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,6 +19,45 @@ def now_utc_iso() -> str:
 def today_utc_yyyymmdd() -> str:
     # Use UTC date to match how we derive brick.day from ISO timestamps (iso[:10])
     return datetime.now(timezone.utc).date().isoformat()
+
+def _tzinfo(tz_name: str | None) -> ZoneInfo:
+    """
+    Resolve IANA tz name safely. Always returns a ZoneInfo.
+    Falls back to UTC if invalid/missing.
+    """
+    name = (tz_name or "").strip()
+    if not name:
+        return ZoneInfo("UTC")
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+def today_local_yyyymmdd(tz_name: str | None) -> str:
+    tz = _tzinfo(tz_name)
+    return datetime.now(tz).date().isoformat()
+
+def day_from_ts_iso_in_tz(ts_iso: str, tz_name: str | None) -> str:
+    """
+    Convert an ISO timestamp to YYYY-MM-DD in the user's timezone.
+    If ts_iso is naive, assume UTC (defensive).
+    """
+    tz = _tzinfo(tz_name)
+    dt = datetime.fromisoformat(ts_iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).date().isoformat()
+
+def utc_iso_floor_local_days_ago(days_ago: int, tz_name: str | None) -> str:
+    """
+    Returns UTC ISO string for local midnight 'days_ago' days ago in tz_name.
+    Example: days_ago=0 => today's local midnight converted to UTC ISO.
+    """
+    tz = _tzinfo(tz_name)
+    local_day = datetime.now(tz).date() - timedelta(days=days_ago)
+    local_midnight = datetime(local_day.year, local_day.month, local_day.day, 0, 0, 0, tzinfo=tz)
+    utc_dt = local_midnight.astimezone(timezone.utc)
+    return utc_dt.isoformat()
 
 def _norm_name(s: str) -> str:
     # Case-insensitive uniqueness + whitespace normalization
@@ -375,7 +415,14 @@ def patch_tracker(owner_id: str, tracker_id: str, patch: Dict[str, Any]) -> Dict
 # ------------------------
 # Bricks
 # ------------------------
-def create_brick(owner_id: str, tracker_id: str, kind: str, payload: Dict[str, Any], ts_iso: Optional[str]) -> Dict[str, Any]:
+def create_brick(
+    owner_id: str,
+    tracker_id: str,
+    kind: str,
+    payload: Dict[str, Any],
+    ts_iso: Optional[str],
+    tz_name: Optional[str] = None,
+) -> Dict[str, Any]:
     tracker = trackers_tbl.get_item(Key={"owner_id": owner_id, "tracker_id": tracker_id}).get("Item")
     if not tracker:
         raise ValueError("tracker_not_found")
@@ -395,7 +442,7 @@ def create_brick(owner_id: str, tracker_id: str, kind: str, payload: Dict[str, A
         payload["text"] = txt.strip()
 
     iso = ts_iso or now_utc_iso()
-    day = iso[:10]  # YYYY-MM-DD (UTC ISO prefix)
+    day = day_from_ts_iso_in_tz(iso, tz_name)  # YYYY-MM-DD in user's tz
 
     item = {
         "owner_id": owner_id,
@@ -425,12 +472,19 @@ def iso_utc_floor_days_ago(days_ago: int) -> str:
     # start of that day in UTC
     return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
 
-def list_bricks_last_days(owner_id: str, tracker_id: str, days: int = 7, limit: int = 300) -> List[Dict[str, Any]]:
+def list_bricks_last_days(
+    owner_id: str,
+    tracker_id: str,
+    days: int = 7,
+    limit: int = 300,
+    tz_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     days = max(1, min(int(days or 7), 31))          # guard rails
     limit = max(1, min(int(limit or 300), 500))     # guard rails
 
     end_iso = now_utc_iso()
-    start_iso = iso_utc_floor_days_ago(days - 1)    # include today as day 0
+    # include today as day 0, based on LOCAL midnight boundaries converted to UTC
+    start_iso = utc_iso_floor_local_days_ago(days - 1, tz_name)
 
     resp = bricks_tbl.query(
         KeyConditionExpression=Key("tracker_id").eq(tracker_id) & Key("ts").between(start_iso, end_iso),
@@ -444,13 +498,13 @@ def list_bricks_last_days(owner_id: str, tracker_id: str, days: int = 7, limit: 
 # ------------------------
 # Dashboard
 # ------------------------
-def dashboard_today(owner_id: str) -> Dict[str, Any]:
+def dashboard_today(owner_id: str, tz_name: Optional[str] = None) -> Dict[str, Any]:
     rings = list_rings(owner_id)
     ring_ids = [r["ring_id"] for r in rings]
 
     # For V1 simplicity: list trackers ring-by-ring and compute completion by "any brick today".
     # This is good for ~20 trackers. Later we can optimize with precomputed stats.
-    today = today_utc_yyyymmdd()
+    today = today_local_yyyymmdd(tz_name)
 
     ring_summaries = []
     for r in rings:
@@ -472,7 +526,8 @@ def dashboard_today(owner_id: str) -> Dict[str, Any]:
             done_today = False
             if bricks:
                 b = _from_ddb(bricks[0])
-                done_today = (b.get("day") == today) and (b.get("owner_id") == owner_id)
+                b_day_local = day_from_ts_iso_in_tz(b.get("ts", ""), tz_name)
+                done_today = (b_day_local == today) and (b.get("owner_id") == owner_id)
             if done_today:
                 done += 1
             tracker_states.append({

@@ -27,6 +27,12 @@ def current_user(x_user_id: str | None = Header(default=None)):
     # V1: header-based user id for speed
     return (x_user_id or "dev-user").strip()
 
+def current_tz(x_user_tz: str | None = Header(default=None, alias="x-user-tz")) -> str:
+    # Browser timezone from client. Example: "America/Denver"
+    # Keep it as a string; db.py will validate/fallback safely.
+    tz = (x_user_tz or "").strip()
+    return tz or "UTC"
+
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()}
@@ -94,7 +100,11 @@ def patch_tracker(tracker_id: str, patch: TrackerPatch, user_id: str = Depends(c
 
 # ---------------- Bricks ----------------
 @app.post("/v1/brick")
-def create_brick(data: BrickIn, user_id: str = Depends(current_user)):
+def create_brick(
+    data: BrickIn,
+    user_id: str = Depends(current_user),
+    tz: str = Depends(current_tz),
+):
     try:
         ts_iso = data.ts.isoformat() if data.ts else None
         return db.create_brick(
@@ -102,7 +112,8 @@ def create_brick(data: BrickIn, user_id: str = Depends(current_user)):
             tracker_id=data.tracker_id,
             kind=data.kind,
             payload=data.payload or {},
-            ts_iso=ts_iso
+            ts_iso=ts_iso,
+            tz_name=tz
         )
     except ValueError as e:
         msg = str(e)
@@ -125,11 +136,14 @@ def get_tracker_bricks(
     tracker_id: str,
     days: int = Query(7, ge=1, le=31),
     user_id: str = Depends(current_user),
+    tz: str = Depends(current_tz),
 ):
-    items = db.list_bricks_last_days(owner_id=user_id, tracker_id=tracker_id, days=days)
+    items = db.list_bricks_last_days(owner_id=user_id, tracker_id=tracker_id, days=days, tz_name=tz)
     return {"tracker_id": tracker_id, "days": days, "items": items}
 
 # ---------------- Dashboard ----------------
-@app.get("/v1/dashboard/today")
-def dashboard_today(user_id: str = Depends(current_user)):
-    return db.dashboard_today(owner_id=user_id)
+def dashboard_today(
+    user_id: str = Depends(current_user),
+    tz: str = Depends(current_tz),
+):
+    return db.dashboard_today(owner_id=user_id, tz_name=tz)
