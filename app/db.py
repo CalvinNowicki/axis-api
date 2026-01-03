@@ -1,5 +1,5 @@
 import os, re, uuid
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -418,6 +418,27 @@ def list_bricks(owner_id: str, tracker_id: str, limit: int = 20) -> List[Dict[st
     )
     items = [_from_ddb(i) for i in resp.get("Items", [])]
     # security: only return those owned by this user
+    return [i for i in items if i.get("owner_id") == owner_id]
+
+def iso_utc_floor_days_ago(days_ago: int) -> str:
+    d = datetime.now(timezone.utc).date() - timedelta(days=days_ago)
+    # start of that day in UTC
+    return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+
+def list_bricks_last_days(owner_id: str, tracker_id: str, days: int = 7, limit: int = 300) -> List[Dict[str, Any]]:
+    days = max(1, min(int(days or 7), 31))          # guard rails
+    limit = max(1, min(int(limit or 300), 500))     # guard rails
+
+    end_iso = now_utc_iso()
+    start_iso = iso_utc_floor_days_ago(days - 1)    # include today as day 0
+
+    resp = bricks_tbl.query(
+        KeyConditionExpression=Key("tracker_id").eq(tracker_id) & Key("ts").between(start_iso, end_iso),
+        ScanIndexForward=False,  # newest first
+        Limit=limit,
+    )
+
+    items = [_from_ddb(i) for i in resp.get("Items", [])]
     return [i for i in items if i.get("owner_id") == owner_id]
 
 # ------------------------

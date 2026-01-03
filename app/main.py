@@ -1,6 +1,6 @@
 from datetime import datetime
 import sys, traceback, os
-from fastapi import FastAPI, Header, Depends, Request, HTTPException, Query
+from fastapi import FastAPI, Header, Depends, Request, HTTPException, Query, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
@@ -119,6 +119,12 @@ def list_bricks(
     user_id: str = Depends(current_user),
 ):
     return db.list_bricks(owner_id=user_id, tracker_id=tracker_id, limit=limit)
+
+router = APIRouter()
+@router.get("/v1/tracker/{tracker_id}/bricks")
+def get_tracker_bricks(tracker_id: str, days: int = Query(7, ge=1, le=31), user=Depends(get_user)):
+    items = list_bricks_last_days(user.owner_id, tracker_id, days=days)
+    return {"tracker_id": tracker_id, "days": days, "items": items}
 
 # ---------------- Dashboard ----------------
 @app.get("/v1/dashboard/today")
