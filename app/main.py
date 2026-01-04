@@ -142,6 +142,7 @@ def get_tracker_bricks(
     return {"tracker_id": tracker_id, "days": days, "items": items}
 
 # ---------------- Dashboard ----------------
+@app.get("/v1/dashboard/today")
 def dashboard_today(
     user_id: str = Depends(current_user),
     tz: str = Depends(current_tz),
