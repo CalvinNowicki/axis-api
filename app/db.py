@@ -579,51 +579,81 @@ def dashboard_contrib(owner_id: str, days: int = 365, tz_name: str = "UTC") -> D
     now_utc = datetime.now(timezone.utc)
     start_utc = now_utc - timedelta(days=days - 1)
 
-    # Aggregate counts by LOCAL day (YYYY-MM-DD)
-    counts: Dict[str, int] = {}
+    # Local "today" is based on tz
+    today_local = now_utc.astimezone(tz).date()
+    start_local = today_local - timedelta(days=days - 1)
 
+    # Build active tracker universe once (denominator)
+    active_tracker_ids: List[str] = []
     rings = list_rings(owner_id)
     for r in rings:
         ring_id = r.get("ring_id")
         if not ring_id:
             continue
-
         trackers = list_trackers(owner_id, ring_id)
-        active = [t for t in trackers if t.get("active", True)]
+        for t in trackers:
+            if t.get("active", True) and t.get("tracker_id"):
+                active_tracker_ids.append(t["tracker_id"])
 
-        for t in active:
-            trk_id = t.get("tracker_id")
-            if not trk_id:
+    # de-dupe just in case
+    active_tracker_ids = sorted(set(active_tracker_ids))
+    total_active = len(active_tracker_ids)
+
+    # Track distinct tracker completions by LOCAL day
+    # day -> set(tracker_id)
+    done_by_day: Dict[str, set] = {}
+
+    for trk_id in active_tracker_ids:
+        # Query bricks for this tracker within UTC window
+        resp = bricks_tbl.query(
+            KeyConditionExpression=Key("tracker_id").eq(trk_id)
+            & Key("ts").between(start_utc.isoformat(), now_utc.isoformat()),
+            ScanIndexForward=True,  # older -> newer (doesn't really matter)
+            Limit=500,              # guard rail per tracker
+        )
+        items = [_from_ddb(i) for i in resp.get("Items", [])]
+
+        for b in items:
+            if b.get("owner_id") != owner_id:
+                continue
+            ts = b.get("ts")
+            if not ts:
                 continue
 
-            # Query bricks for this tracker within UTC window
-            resp = bricks_tbl.query(
-                KeyConditionExpression=Key("tracker_id").eq(trk_id) & Key("ts").between(
-                    start_utc.isoformat(),
-                    now_utc.isoformat(),
-                ),
-                ScanIndexForward=True,  # older -> newer (doesn't really matter)
-                Limit=500,              # guard rail per tracker
-            )
-            items = [_from_ddb(i) for i in resp.get("Items", [])]
+            day_local = _iso_to_local_day(ts, tz)
 
-            # Security: only the owner’s bricks
-            for b in items:
-                if b.get("owner_id") != owner_id:
-                    continue
-                ts = b.get("ts")
-                if not ts:
-                    continue
-                day_local = _iso_to_local_day(ts, tz)
-                counts[day_local] = counts.get(day_local, 0) + 1
+            # extra safety: ensure within the local window we emit
+            d_date = date.fromisoformat(day_local)
+            if d_date < start_local or d_date > today_local:
+                continue
+
+            s = done_by_day.get(day_local)
+            if s is None:
+                s = set()
+                done_by_day[day_local] = s
+            s.add(trk_id)
 
     # Emit dense list for the last N days (so UI can render blanks)
-    # Local "today" is based on tz
-    today_local = now_utc.astimezone(tz).date()
     series = []
     for i in range(days):
         d = (today_local - timedelta(days=(days - 1 - i))).isoformat()
-        series.append({"day": d, "count": counts.get(d, 0)})
+        done = len(done_by_day.get(d, set()))
+        pct = (done / total_active) if total_active else 0.0
 
-    total = sum(c["count"] for c in series)
-    return {"days": days, "total": total, "items": series, "tz": str(tz)}
+        series.append({
+            "day": d,
+            "done": done,
+            "total": total_active,
+            "percent": pct,  # 0..1
+        })
+
+    # total percent across the window isn't super meaningful; keep something simple:
+    avg_percent = (sum(x["percent"] for x in series) / days) if days else 0.0
+
+    return {
+        "days": days,
+        "total_active": total_active,
+        "avg_percent": avg_percent,
+        "items": series,
+        "tz": str(tz),
+    }
