@@ -11,6 +11,8 @@ from botocore.exceptions import ClientError
 
 from .settings import settings
 
+from zoneinfo import ZoneInfo
+
 _slug_re = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 def now_utc_iso() -> str:
@@ -550,3 +552,78 @@ def dashboard_today(owner_id: str, tz_name: Optional[str] = None) -> Dict[str, A
         "date": today,
         "rings": ring_summaries,
     }
+
+
+# ------------------------
+# Contribution Heatmap
+# ------------------------
+def _safe_tz(tz_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo((tz_name or "UTC").strip())
+    except Exception:
+        return ZoneInfo("UTC")
+
+def _iso_to_local_day(iso_ts: str, tz: ZoneInfo) -> str:
+    # iso_ts like "2026-01-04T20:01:37.750215+00:00"
+    # Convert to tz and return YYYY-MM-DD
+    dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).date().isoformat()
+
+def dashboard_contrib(owner_id: str, days: int = 365, tz_name: str = "UTC") -> Dict[str, Any]:
+    days = max(7, min(int(days or 365), 730))
+    tz = _safe_tz(tz_name)
+
+    # We'll include "today" in the window
+    now_utc = datetime.now(timezone.utc)
+    start_utc = now_utc - timedelta(days=days - 1)
+
+    # Aggregate counts by LOCAL day (YYYY-MM-DD)
+    counts: Dict[str, int] = {}
+
+    rings = list_rings(owner_id)
+    for r in rings:
+        ring_id = r.get("ring_id")
+        if not ring_id:
+            continue
+
+        trackers = list_trackers(owner_id, ring_id)
+        active = [t for t in trackers if t.get("active", True)]
+
+        for t in active:
+            trk_id = t.get("tracker_id")
+            if not trk_id:
+                continue
+
+            # Query bricks for this tracker within UTC window
+            resp = bricks_tbl.query(
+                KeyConditionExpression=Key("tracker_id").eq(trk_id) & Key("ts").between(
+                    start_utc.isoformat(),
+                    now_utc.isoformat(),
+                ),
+                ScanIndexForward=True,  # older -> newer (doesn't really matter)
+                Limit=500,              # guard rail per tracker
+            )
+            items = [_from_ddb(i) for i in resp.get("Items", [])]
+
+            # Security: only the owner’s bricks
+            for b in items:
+                if b.get("owner_id") != owner_id:
+                    continue
+                ts = b.get("ts")
+                if not ts:
+                    continue
+                day_local = _iso_to_local_day(ts, tz)
+                counts[day_local] = counts.get(day_local, 0) + 1
+
+    # Emit dense list for the last N days (so UI can render blanks)
+    # Local "today" is based on tz
+    today_local = now_utc.astimezone(tz).date()
+    series = []
+    for i in range(days):
+        d = (today_local - timedelta(days=(days - 1 - i))).isoformat()
+        series.append({"day": d, "count": counts.get(d, 0)})
+
+    total = sum(c["count"] for c in series)
+    return {"days": days, "total": total, "items": series, "tz": str(tz)}

@@ -141,6 +141,16 @@ def get_tracker_bricks(
     items = db.list_bricks_last_days(owner_id=user_id, tracker_id=tracker_id, days=days, tz_name=tz)
     return {"tracker_id": tracker_id, "days": days, "items": items}
 
+# ---------------- Contributions (Heatmap) ----------------
+@app.get("/v1/dashboard/contrib")
+def dashboard_contrib(
+    days: int = Query(365, ge=7, le=730),
+    user_id: str = Depends(current_user),
+    tz: str = Depends(current_tz),
+):
+    # Returns counts per local day for a GitHub-style heatmap
+    return db.dashboard_contrib(owner_id=user_id, days=days, tz_name=tz)
+
 # ---------------- Dashboard ----------------
 @app.get("/v1/dashboard/today")
 def dashboard_today(
