@@ -583,21 +583,36 @@ def dashboard_contrib(owner_id: str, days: int = 365, tz_name: str = "UTC") -> D
     today_local = now_utc.astimezone(tz).date()
     start_local = today_local - timedelta(days=days - 1)
 
-    # Build active tracker universe once (denominator)
-    active_tracker_ids: List[str] = []
+    # Build active tracker universe once, but keep created day for day-specific denominators
+    # tracker_id -> created_local_day (YYYY-MM-DD)
+    tracker_created_day: Dict[str, str] = {}
+
     rings = list_rings(owner_id)
     for r in rings:
         ring_id = r.get("ring_id")
         if not ring_id:
             continue
+
         trackers = list_trackers(owner_id, ring_id)
         for t in trackers:
-            if t.get("active", True) and t.get("tracker_id"):
-                active_tracker_ids.append(t["tracker_id"])
+            if not t.get("active", True):
+                continue
+            trk_id = t.get("tracker_id")
+            if not trk_id:
+                continue
 
-    # de-dupe just in case
-    active_tracker_ids = sorted(set(active_tracker_ids))
-    total_active = len(active_tracker_ids)
+            created_ts = t.get("created_ts")
+            if created_ts:
+                created_local = _iso_to_local_day(created_ts, tz)
+            else:
+                # fallback: if missing, treat as eligible for the whole window
+                created_local = start_local.isoformat()
+
+            tracker_created_day[trk_id] = created_local
+
+    # de-dupe + stable order
+    active_tracker_ids = sorted(tracker_created_day.keys())
+    total_active = len(active_tracker_ids)  # still useful as "current active"
 
     # Track distinct tracker completions by LOCAL day
     # day -> set(tracker_id)
@@ -622,6 +637,11 @@ def dashboard_contrib(owner_id: str, days: int = 365, tz_name: str = "UTC") -> D
 
             day_local = _iso_to_local_day(ts, tz)
 
+            # If the tracker didn't exist yet on that local day, ignore it
+            created_local = tracker_created_day.get(trk_id)
+            if created_local and date.fromisoformat(day_local) < date.fromisoformat(created_local):
+                continue
+
             # extra safety: ensure within the local window we emit
             d_date = date.fromisoformat(day_local)
             if d_date < start_local or d_date > today_local:
@@ -634,16 +654,24 @@ def dashboard_contrib(owner_id: str, days: int = 365, tz_name: str = "UTC") -> D
             s.add(trk_id)
 
     # Emit dense list for the last N days (so UI can render blanks)
+    # Denominator is day-specific: only trackers created on/before that local day
     series = []
     for i in range(days):
         d = (today_local - timedelta(days=(days - 1 - i))).isoformat()
+        d_date = date.fromisoformat(d)
+
+        total_that_day = sum(
+            1 for _, cday in tracker_created_day.items()
+            if date.fromisoformat(cday) <= d_date
+        )
+
         done = len(done_by_day.get(d, set()))
-        pct = (done / total_active) if total_active else 0.0
+        pct = (done / total_that_day) if total_that_day else 0.0
 
         series.append({
             "day": d,
             "done": done,
-            "total": total_active,
+            "total": total_that_day,
             "percent": pct,  # 0..1
         })
 
